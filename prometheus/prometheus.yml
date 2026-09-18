@@ -1,0 +1,25 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Local development: a single agent on the host.
+  - job_name: pulseprobe-local
+    static_configs:
+      - targets: ["localhost:9100"]
+
+  # In-cluster without the Prometheus Operator: discover every node and scrape
+  # the DaemonSet pod on it via hostNetwork.
+  - job_name: pulseprobe-nodes
+    kubernetes_sd_configs:
+      - role: node
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: "([^:]+)(:\\d+)?"
+        target_label: __address__
+        replacement: "${1}:9100"
+      - source_labels: [__meta_kubernetes_node_name]
+        target_label: kubernetes_node
+
+rule_files:
+  - alerts.yml

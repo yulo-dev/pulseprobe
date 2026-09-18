@@ -1,0 +1,122 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler:
+          - {cc: gcc, cxx: g++}
+          - {cc: clang, cxx: clang++}
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.compiler.cc }}
+          CXX: ${{ matrix.compiler.cxx }}
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DPULSEPROBE_WERROR=ON
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # The registry's whole point is that scrapes and samples do not contend, so
+  # the claim is checked by a tool rather than by reading the code.
+  sanitizers:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [thread, address]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DPULSEPROBE_SANITIZER=${{ matrix.sanitizer }}
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t pulseprobe:ci .
+
+      # Smoke-test the actual image, not just the binary: a container that
+      # cannot read procfs or cannot bind its port is a shipping failure the
+      # unit tests would never catch.
+      - name: Run container and scrape it
+        run: |
+          docker run -d --name pulseprobe -p 9100:9100 pulseprobe:ci --interval=1
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:9100/readyz >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -sf http://localhost:9100/metrics | tee /tmp/metrics.txt
+          grep -q '^pulseprobe_cpu_usage_percent ' /tmp/metrics.txt
+          grep -q '^pulseprobe_memory_total_bytes ' /tmp/metrics.txt
+          # No driver in CI, so this must report unavailable rather than crash.
+          grep -q '^pulseprobe_gpu_available 0$' /tmp/metrics.txt
+          docker rm -f pulseprobe
+
+  kubernetes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: pulseprobe
+
+      - name: Build and load image
+        run: |
+          docker build -t pulseprobe:ci .
+          kind load docker-image pulseprobe:ci --name pulseprobe
+
+      - name: Deploy DaemonSet
+        run: |
+          kubectl create namespace monitoring
+          sed -e 's|ghcr.io/OWNER/pulseprobe:0.1.0|pulseprobe:ci|' \
+              -e 's|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|' \
+              deploy/daemonset.yaml | kubectl apply -f -
+          kubectl -n monitoring rollout status daemonset/pulseprobe --timeout=180s
+
+      - name: Scrape from inside the cluster
+        run: |
+          # Goes through the readiness gate: rollout status above only returns
+          # once /readyz passes, which means a real CPU delta exists.
+          POD=$(kubectl -n monitoring get pod -l app.kubernetes.io/name=pulseprobe \
+                -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n monitoring exec "$POD" -- /usr/local/bin/pulseprobe --help >/dev/null
+          kubectl -n monitoring port-forward "$POD" 9100:9100 &
+          sleep 5
+          curl -sf http://localhost:9100/metrics > /tmp/metrics.txt
+          # The node label comes from the downward API, so its presence proves
+          # the pod spec wiring works, not just the binary.
+          grep -q 'node="pulseprobe-control-plane"' /tmp/metrics.txt
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          kubectl -n monitoring describe daemonset pulseprobe
+          kubectl -n monitoring get pods -o wide
+          kubectl -n monitoring logs -l app.kubernetes.io/name=pulseprobe --tail=100

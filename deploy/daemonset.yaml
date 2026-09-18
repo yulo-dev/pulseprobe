@@ -1,0 +1,154 @@
+# PulseProbe runs as a DaemonSet: one pod per node, because the thing being
+# measured is the node, not the workload. A Deployment with N replicas would
+# sample whichever nodes the scheduler happened to place it on and miss the
+# rest.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: pulseprobe
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: pulseprobe
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pulseprobe
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Telemetry gaps are cheap; a cluster-wide restart is not.
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pulseprobe
+    spec:
+      # Keeps the agent running on nodes under eviction pressure. An agent that
+      # gets evicted first is blind exactly when the node is in trouble.
+      priorityClassName: system-node-critical
+
+      # Required for GPU job attribution: NVML reports host PIDs, so without the
+      # host PID namespace the PIDs it returns cannot be matched against the
+      # scheduler's job mapping.
+      hostPID: true
+
+      # Scrapeable at <node-ip>:9100 without a per-node Service.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+
+      tolerations:
+        # Run everywhere, including nodes reserved by taints. A monitoring
+        # agent that skips tainted nodes leaves the GPU fleet unmonitored,
+        # since those are usually the tainted ones.
+        - operator: Exists
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+
+      containers:
+        - name: pulseprobe
+          image: ghcr.io/OWNER/pulseprobe:0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --port=9100
+            - --interval=5
+            # Host procfs and cgroupfs are mounted under /host, so the agent is
+            # pointed at them rather than at its own container's view.
+            - --procfs-root=/host/proc
+            - --cgroup-root=/host/sys/fs/cgroup
+            - --job-map-dir=/var/run/pulseprobe/jobs
+          env:
+            # Every exported series is labelled with this, which is what makes a
+            # cluster-wide scrape attributable to a specific node.
+            - name: PULSEPROBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+
+          ports:
+            - name: metrics
+              containerPort: 9100
+              hostPort: 9100
+              protocol: TCP
+
+          # Liveness does not depend on the sampler: a wedged collector should
+          # not trigger restarts that destroy the evidence.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 20
+            failureThreshold: 3
+
+          # Readiness does: CPU utilisation is a delta between two samples, so
+          # the agent has nothing worth scraping until the second cycle. Without
+          # this the first scrape after every rollout reads as a gap.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: 10m
+              memory: 24Mi
+            limits:
+              # No CPU limit on purpose: throttling a monitoring agent under
+              # node pressure loses data at the moment it matters most.
+              memory: 64Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: host-proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: host-cgroup
+              mountPath: /host/sys/fs/cgroup
+              readOnly: true
+            - name: job-map
+              mountPath: /var/run/pulseprobe/jobs
+              readOnly: true
+
+      volumes:
+        - name: host-proc
+          hostPath:
+            path: /proc
+            type: Directory
+        - name: host-cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        # Written by the scheduler's prolog/epilog on HPC nodes. DirectoryOrCreate
+        # so the agent still starts on nodes that have no scheduler; job
+        # attribution is then simply absent.
+        - name: job-map
+          hostPath:
+            path: /var/run/pulseprobe/jobs
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pulseprobe
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: pulseprobe
+spec:
+  clusterIP: None  # headless: one endpoint per node, not a load-balanced VIP
+  selector:
+    app.kubernetes.io/name: pulseprobe
+  ports:
+    - name: metrics
+      port: 9100
+      targetPort: metrics

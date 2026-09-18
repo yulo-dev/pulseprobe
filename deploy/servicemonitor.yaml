@@ -1,0 +1,25 @@
+# For clusters running the Prometheus Operator. Without the operator, use the
+# static scrape config in prometheus/prometheus.yml instead.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: pulseprobe
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: pulseprobe
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pulseprobe
+  endpoints:
+    - port: metrics
+      path: /metrics
+      # Matches the agent's own 5s sampling interval. Scraping faster than the
+      # agent samples just republishes the same snapshot.
+      interval: 15s
+      scrapeTimeout: 10s
+      relabelings:
+        # Keep the Kubernetes node identity alongside the agent's own node
+        # label, so a series can be joined against kube-state-metrics.
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: kubernetes_node

@@ -1,0 +1,52 @@
+groups:
+  - name: pulseprobe
+    rules:
+      - alert: PulseProbeAgentDown
+        expr: up{job=~"pulseprobe.*"} == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "No telemetry from {{ $labels.instance }}"
+
+      - alert: NodeCpuSaturated
+        expr: pulseprobe_cpu_usage_percent > 90
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.node }} CPU above 90% for 10m"
+
+      # Deliberately not alerting on pulseprobe_memory_usage_percent: on a busy
+      # node most of that is reclaimable page cache. MemAvailable is the number
+      # that says whether an allocation would actually succeed.
+      - alert: NodeMemoryExhausted
+        expr: pulseprobe_memory_available_bytes / pulseprobe_memory_total_bytes < 0.10
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.node }} has under 10% available memory"
+
+      - alert: ContainerNearMemoryLimit
+        expr: pulseprobe_cgroup_memory_usage_percent > 90
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Container on {{ $labels.node }} within 10% of its cgroup memory limit"
+
+      # The expensive failure mode on a GPU fleet: a job holds a device, so the
+      # scheduler will not hand it to anyone else, but runs nothing on it. Only
+      # expressible because GPU series carry the owning job ID.
+      - alert: GpuReservedButIdle
+        expr: |
+          avg_over_time(pulseprobe_gpu_utilization_percent{job_id!=""}[30m]) < 5
+          and on (node, gpu) pulseprobe_gpu_memory_used_bytes > 1e9
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "Job {{ $labels.job_id }} holds GPU {{ $labels.gpu }} on {{ $labels.node }} at under 5% utilisation"
+
+      - alert: GpuThermalThrottleRisk
+        expr: pulseprobe_gpu_temperature_celsius > 85
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "GPU {{ $labels.gpu }} on {{ $labels.node }} above 85C"
