@@ -19,7 +19,7 @@ exactly one agent.
 ```
 
 ## Quick start
-
+ 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j"$(nproc)"
